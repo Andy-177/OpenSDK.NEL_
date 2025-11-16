@@ -1,12 +1,13 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
-    <PropertyGroup>
-        <OutputType>Exe</OutputType>
-        <TargetFramework>net9.0</TargetFramework>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
-        <InvariantGlobalization>true</InvariantGlobalization>
-    </PropertyGroup>
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>OpenSDK.NEL</AssemblyName>
+  </PropertyGroup>
 
     <ItemGroup>
         <Reference Include="Codexus.Cipher">
@@ -24,9 +25,9 @@
         <Reference Include="Codexus.OpenSDK">
             <HintPath>..\SDK\Codexus.OpenSDK.dll</HintPath>
         </Reference>
-    </ItemGroup>
+  </ItemGroup>
 
-    <ItemGroup>
+  <ItemGroup>
         <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2"/>
         <PackageReference Include="DotNetty.Buffers" Version="0.7.6"/>
         <PackageReference Include="DotNetty.Codecs" Version="0.7.6"/>
@@ -40,6 +41,20 @@
         <PackageReference Include="SharpZipLib" Version="1.4.2"/>
         <PackageReference Include="System.IO.Hashing" Version="10.0.0"/>
         <PackageReference Include="YamlDotNet" Version="16.3.0"/>
-    </ItemGroup>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="resources\**\*">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <PropertyGroup>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
 
 </Project>

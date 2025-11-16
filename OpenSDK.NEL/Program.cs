@@ -1,4 +1,9 @@
-﻿using System.Text.Json;
+﻿using System.Net;
+using System.Text;
+using System.Text.Json;
+using System.Net;
+using System.Text;
+using System.Threading;
 using Codexus.Cipher.Entities;
 using Codexus.Cipher.Entities.WPFLauncher.NetGame;
 using Codexus.Cipher.Protocol;
@@ -18,25 +23,18 @@ using Codexus.OpenSDK.Yggdrasil;
 using OpenSDK.NEL;
 using OpenSDK.NEL.Entities;
 using Serilog;
+using System.Collections.Concurrent;
+using System.Linq;
 
 ConfigureLogger();
 
-Log.Information("* 此软件基于 Codexus.OpenSDK 以及 Codexus.Development.SDK 制作，旨在为您提供更简洁的脱盒体验。");
-
 await InitializeSystemComponentsAsync();
 
-var services = await CreateServices();
+AppState.Services = await CreateServices();
+await AppState.Services.X19.InitializeDeviceAsync();
 
-await services.X19.InitializeDeviceAsync();
-
-var (authOtp, channel) = await LoginAsync(services);
-Log.Information("已登录至用户: {Id}, 渠道: {Channel}", authOtp.EntityId, channel);
-
-while (true)
-{
-    var selectedServer = await SelectServerAsync(authOtp);
-    await ManageServerAsync(authOtp, services, selectedServer);
-}
+await StartWebServerAsync();
+await Task.Delay(Timeout.Infinite);
 
 static void ConfigureLogger()
 {
@@ -57,7 +55,7 @@ static async Task InitializeSystemComponentsAsync()
 
 static async Task<Services> CreateServices()
 {
-    var api = new WebNexusApi("YXBwSWQ9Q29kZXh1cy5HYXRld2F5LmFwcFNlY3JldD1hN0s5bTJYcUw4YkM0d1ox");
+    var api = new WebNexusApi("");
     var register = new Channel4399Register();
     var c4399 = new C4399();
     var x19 = new X19();
@@ -79,7 +77,6 @@ static async Task<(X19AuthenticationOtp, string)> LoginAsync(Services services)
     return mode switch
     {
         "1" => await LoginWithCookieAsync(services.X19),
-        "2" => await LoginWith4399Async(services),
         _ => throw new ArgumentException($"不支持的登录模式: {mode}")
     };
 }
@@ -392,6 +389,407 @@ static async Task<string> ComputeCrcSalt()
     return string.Empty;
 }
 
+static async Task StartWebServerAsync()
+{
+    var port = GetPort();
+    var listener = new HttpListener();
+    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+    listener.Prefixes.Add($"http://localhost:{port}/");
+    listener.Start();
+    _ = Task.Run(async () =>
+    {
+        while (true)
+        {
+            var ctx = await listener.GetContextAsync();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await ServeContextAsync(ctx);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "请求处理异常");
+                }
+            });
+        }
+    });
+    Log.Information("WebUI已启动: http://127.0.0.1:{Port}/", port);
+    Log.Information("WS已启动服务器: ws://127.0.0.1:{Port}/ws", port);
+}
+
+static int GetPort()
+{
+    var env = Environment.GetEnvironmentVariable("NEL_PORT");
+    if (int.TryParse(env, out var p) && p > 0) return p;
+    return 8080;
+}
+
+static async Task ServeContextAsync(HttpListenerContext context)
+{
+    var req = context.Request;
+    if (req.Url!.AbsolutePath == "/ws")
+    {
+        if (req.IsWebSocketRequest)
+        {
+            var wsCtx = await context.AcceptWebSocketAsync(null);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await HandleWebSocket(wsCtx.WebSocket);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "WS连接处理异常");
+                }
+            });
+            return;
+        }
+        context.Response.StatusCode = 400;
+        context.Response.Close();
+        return;
+    }
+
+    var root = Path.Combine(AppContext.BaseDirectory, "resources");
+    var path = req.Url.AbsolutePath;
+    if (path == "/") path = "/index.html";
+    var filePath = Path.GetFullPath(Path.Combine(root, path.TrimStart('/')));
+    if (!filePath.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(filePath))
+    {
+        context.Response.StatusCode = 404;
+        context.Response.Close();
+        return;
+    }
+    await WriteFileResponse(context.Response, filePath);
+}
+
+static async Task HandleWebSocket(System.Net.WebSockets.WebSocket ws)
+{
+    var buffer = new byte[4096];
+    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes("connected")), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+    var accountsItems = AppState.Accounts.Select(kv => new { entityId = kv.Key, channel = kv.Value }).ToArray();
+    var initMsg = JsonSerializer.Serialize(new { type = "accounts", items = accountsItems });
+    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(initMsg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+    var channelItems = AppState.Channels.Values.Select(ch => new { serverId = ch.ServerId, serverName = ch.ServerName, address = ch.Ip + ":" + ch.Port }).ToArray();
+    var chMsg = JsonSerializer.Serialize(new { type = "channels", items = channelItems });
+    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(chMsg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+    while (ws.State == System.Net.WebSockets.WebSocketState.Open)
+    {
+        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+        if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close)
+        {
+            await ws.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
+            break;
+        }
+        var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            var root = doc.RootElement;
+            var type = root.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (type == "cookie_login")
+            {
+                var cookie = root.TryGetProperty("cookie", out var c) ? c.GetString() : null;
+                if (string.IsNullOrWhiteSpace(cookie))
+                {
+                    var err = JsonSerializer.Serialize(new { type = "login_error", message = "cookie为空" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                try
+                {
+                    var (authOtp, channel) = await AppState.Services!.X19.ContinueAsync(cookie);
+                    Log.Information("Cookie登录成功: {Id}, {Channel}", authOtp.EntityId, channel);
+                    AppState.Accounts[authOtp.EntityId] = channel;
+                    AppState.Auths[authOtp.EntityId] = authOtp;
+                    AppState.SelectedAccountId = authOtp.EntityId;
+                    var ok = JsonSerializer.Serialize(new { type = "login_success", entityId = authOtp.EntityId, channel });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(ok)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Cookie登录失败");
+                    var err = JsonSerializer.Serialize(new { type = "login_error", message = "登录失败" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                continue;
+            }
+            if (type == "login_4399")
+            {
+                var account = root.TryGetProperty("account", out var acc) ? acc.GetString() : null;
+                var password = root.TryGetProperty("password", out var pwd) ? pwd.GetString() : null;
+                if (string.IsNullOrWhiteSpace(account) || string.IsNullOrWhiteSpace(password))
+                {
+                    var err = JsonSerializer.Serialize(new { type = "login_error", message = "账号或密码为空" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                try
+                {
+                    var json = await AppState.Services!.C4399.LoginWithPasswordAsync(account, password);
+                    var (authOtp, channel) = await AppState.Services!.X19.ContinueAsync(json);
+                    AppState.Accounts[authOtp.EntityId] = channel;
+                    AppState.Auths[authOtp.EntityId] = authOtp;
+                    AppState.SelectedAccountId = authOtp.EntityId;
+                    var ok = JsonSerializer.Serialize(new { type = "login_success", entityId = authOtp.EntityId, channel });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(ok)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "4399登录失败");
+                    var err = JsonSerializer.Serialize(new { type = "login_error", message = "登录失败" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                continue;
+            }
+            if (type == "delete_account")
+            {
+                var id = root.TryGetProperty("entityId", out var idProp) ? idProp.GetString() : null;
+                if (string.IsNullOrWhiteSpace(id))
+                {
+                    var err = JsonSerializer.Serialize(new { type = "delete_error", message = "entityId为空" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                if (AppState.Accounts.TryRemove(id, out _))
+                {
+                    Log.Information("已删除账号: {Id}", id);
+                    if (AppState.SelectedAccountId == id) AppState.SelectedAccountId = null;
+                }
+                else
+                {
+                    Log.Warning("删除账号失败，未找到: {Id}", id);
+                }
+                var accountsItems2 = AppState.Accounts.Select(kv => new { entityId = kv.Key, channel = kv.Value }).ToArray();
+                var msg = JsonSerializer.Serialize(new { type = "accounts", items = accountsItems2 });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            if (type == "list_accounts")
+            {
+                var accItems = AppState.Accounts.Select(kv => new { entityId = kv.Key, channel = kv.Value }).ToArray();
+                var msg = JsonSerializer.Serialize(new { type = "accounts", items = accItems });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            if (type == "select_account")
+            {
+                var id = root.TryGetProperty("entityId", out var idProp2) ? idProp2.GetString() : null;
+                if (string.IsNullOrWhiteSpace(id) || !AppState.Auths.ContainsKey(id))
+                {
+                    var notLogin2 = JsonSerializer.Serialize(new { type = "notlogin" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(notLogin2)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                AppState.SelectedAccountId = id;
+                var okSel = JsonSerializer.Serialize(new { type = "selected_account", entityId = id });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(okSel)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            if (type == "list_servers")
+            {
+                var keyword = root.TryGetProperty("keyword", out var k) ? k.GetString() : string.Empty;
+                var sel = AppState.SelectedAccountId;
+                if (string.IsNullOrEmpty(sel) || !AppState.Auths.TryGetValue(sel, out var auth))
+                {
+                    var notLogin = JsonSerializer.Serialize(new { type = "notlogin" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(notLogin)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                try
+                {
+                    var servers = await auth.Api<EntityNetGameKeyword, Entities<EntityNetGameItem>>(
+                        "/item/query/search-by-keyword",
+                        new EntityNetGameKeyword { Keyword = keyword ?? string.Empty });
+                    Log.Information("服务器搜索: 关键字={Keyword}, 数量={Count}", keyword, servers.Data?.Length ?? 0);
+                    var items = servers.Data.Select(s => new { entityId = s.EntityId, name = s.Name }).ToArray();
+                    var msg = JsonSerializer.Serialize(new { type = "servers", items });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "获取服务器列表失败");
+                    var err = JsonSerializer.Serialize(new { type = "servers_error", message = "获取失败" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                continue;
+            }
+            if (type == "open_server")
+            {
+                var serverId = root.TryGetProperty("serverId", out var sid) ? sid.GetString() : null;
+                var serverName = root.TryGetProperty("serverName", out var sname) ? sname.GetString() : string.Empty;
+                var sel = AppState.SelectedAccountId;
+                if (string.IsNullOrEmpty(sel) || !AppState.Auths.TryGetValue(sel, out var auth))
+                {
+                    var notLogin = JsonSerializer.Serialize(new { type = "notlogin" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(notLogin)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                if (string.IsNullOrWhiteSpace(serverId))
+                {
+                    var err = JsonSerializer.Serialize(new { type = "server_roles_error", message = "参数错误" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                var roles = await GetServerRolesByIdAsync(auth, serverId);
+                var items = roles.Select(r => new { id = r.GameId, name = r.Name }).ToArray();
+                var msg = JsonSerializer.Serialize(new { type = "server_roles", items, serverId, serverName });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            if (type == "create_role_random")
+            {
+                var serverId = root.TryGetProperty("serverId", out var sid) ? sid.GetString() : null;
+                var sel = AppState.SelectedAccountId;
+                if (string.IsNullOrEmpty(sel) || !AppState.Auths.TryGetValue(sel, out var auth))
+                {
+                    var notLogin = JsonSerializer.Serialize(new { type = "notlogin" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(notLogin)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                if (string.IsNullOrWhiteSpace(serverId))
+                {
+                    var err = JsonSerializer.Serialize(new { type = "server_roles_error", message = "参数错误" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                var name = StringGenerator.GenerateRandomString(12, false);
+                await CreateCharacterByIdAsync(auth, serverId, name);
+                var roles = await GetServerRolesByIdAsync(auth, serverId);
+                var items = roles.Select(r => new { id = r.GameId, name = r.Name }).ToArray();
+                var msg = JsonSerializer.Serialize(new { type = "server_roles", items, serverId, createdName = name });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            if (type == "create_role_named")
+            {
+                var serverId = root.TryGetProperty("serverId", out var sid) ? sid.GetString() : null;
+                var name = root.TryGetProperty("name", out var n) ? n.GetString() : null;
+                var sel = AppState.SelectedAccountId;
+                if (string.IsNullOrEmpty(sel) || !AppState.Auths.TryGetValue(sel, out var auth))
+                {
+                    var notLogin = JsonSerializer.Serialize(new { type = "notlogin" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(notLogin)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                if (string.IsNullOrWhiteSpace(serverId) || string.IsNullOrWhiteSpace(name))
+                {
+                    var err = JsonSerializer.Serialize(new { type = "server_roles_error", message = "参数错误" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                await CreateCharacterByIdAsync(auth, serverId, name);
+                var roles = await GetServerRolesByIdAsync(auth, serverId);
+                var items = roles.Select(r => new { id = r.GameId, name = r.Name }).ToArray();
+                var msg = JsonSerializer.Serialize(new { type = "server_roles", items, serverId, createdName = name });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            if (type == "start_proxy")
+            {
+                var serverId = root.TryGetProperty("serverId", out var sid) ? sid.GetString() : null;
+                var serverName = root.TryGetProperty("serverName", out var sname) ? sname.GetString() : string.Empty;
+                var roleId = root.TryGetProperty("roleId", out var rid) ? rid.GetString() : null;
+                var sel = AppState.SelectedAccountId;
+                if (string.IsNullOrEmpty(sel) || !AppState.Auths.TryGetValue(sel, out var auth))
+                {
+                    var notLogin = JsonSerializer.Serialize(new { type = "notlogin" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(notLogin)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                if (string.IsNullOrWhiteSpace(serverId) || string.IsNullOrWhiteSpace(roleId))
+                {
+                    var err = JsonSerializer.Serialize(new { type = "start_error", message = "参数错误" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                    continue;
+                }
+                try
+                {
+                    var roles = await GetServerRolesByIdAsync(auth, serverId);
+                    var selected = roles.FirstOrDefault(r => r.GameId == roleId);
+                    if (selected == null)
+                    {
+                        var err = JsonSerializer.Serialize(new { type = "start_error", message = "角色不存在" });
+                        await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                        continue;
+                    }
+                    var address = await auth.Api<EntityAddressRequest, Entity<EntityNetGameServerAddress>>(
+                        "/item-address/get",
+                        new EntityAddressRequest { ItemId = serverId });
+                    var cts = new CancellationTokenSource();
+                    AppState.Channels[serverId!] = new ChannelInfo
+                    {
+                        ServerId = serverId!,
+                        ServerName = serverName,
+                        Ip = address.Data!.Ip,
+                        Port = address.Data!.Port,
+                        RoleName = selected.Name,
+                        Cts = cts
+                    };
+                    _ = Task.Run(async () =>
+                    {
+                        await StartProxyWithRoleByIdAsync(auth, AppState.Services!, serverId!, serverName, selected, cts.Token);
+                    });
+                    var items3 = AppState.Channels.Values.Select(ch => new { serverId = ch.ServerId, serverName = ch.ServerName, address = ch.Ip + ":" + ch.Port }).ToArray();
+                    var ok = JsonSerializer.Serialize(new { type = "channels", items = items3 });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(ok)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "启动代理失败");
+                    var err = JsonSerializer.Serialize(new { type = "start_error", message = "启动失败" });
+                    await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                continue;
+            }
+            if (type == "list_channels")
+            {
+                var items4 = AppState.Channels.Values.Select(ch => new { serverId = ch.ServerId, serverName = ch.ServerName, address = ch.Ip + ":" + ch.Port }).ToArray();
+                var msg = JsonSerializer.Serialize(new { type = "channels", items = items4 });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            if (type == "close_channel")
+            {
+                var serverId2 = root.TryGetProperty("serverId", out var sid2) ? sid2.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(serverId2) && AppState.Channels.TryRemove(serverId2, out var ch)) ch.Cts.Cancel();
+                var items5 = AppState.Channels.Values.Select(cc => new { serverId = cc.ServerId, serverName = cc.ServerName, address = cc.Ip + ":" + cc.Port }).ToArray();
+                var msg2 = JsonSerializer.Serialize(new { type = "channels", items = items5 });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(msg2)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                continue;
+            }
+            await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(text)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+        catch
+        {
+            await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(text)), System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+    }
+}
+
+static async Task WriteFileResponse(HttpListenerResponse resp, string filePath)
+{
+    var content = await File.ReadAllBytesAsync(filePath);
+    resp.ContentType = GetMimeType(filePath);
+    resp.ContentLength64 = content.Length;
+    await resp.OutputStream.WriteAsync(content, 0, content.Length);
+    resp.Close();
+}
+
+static string GetMimeType(string path)
+{
+    var ext = Path.GetExtension(path).ToLowerInvariant();
+    if (ext == ".html") return "text/html";
+    if (ext == ".css") return "text/css";
+    if (ext == ".js") return "application/javascript";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".ico") return "image/x-icon";
+    return "application/octet-stream";
+}
+
 static string ReadOption(string prompt, string[] validInputs)
 {
     while (true)
@@ -428,6 +826,73 @@ static int ReadNumberInRange(int min, int max, string prompt)
     }
 }
 
+ 
+
+static async Task CreateCharacterByIdAsync(X19AuthenticationOtp authOtp, string serverId, string name)
+{
+    await authOtp.Api<EntityCreateCharacter, JsonElement>(
+        "/game-character",
+        new EntityCreateCharacter
+        {
+            GameId = serverId,
+            UserId = authOtp.EntityId,
+            Name = name
+        });
+}
+
+static async Task<EntityGameCharacter[]> GetServerRolesByIdAsync(X19AuthenticationOtp authOtp, string serverId)
+{
+    var roles = await authOtp.Api<EntityQueryGameCharacters, Entities<EntityGameCharacter>>(
+        "/game-character/query/user-game-characters",
+        new EntityQueryGameCharacters
+        {
+            GameId = serverId,
+            UserId = authOtp.EntityId
+        });
+
+    return roles.Data;
+}
+
+static async Task<bool> StartProxyWithRoleByIdAsync(X19AuthenticationOtp authOtp, Services services, string serverId, string serverName, EntityGameCharacter selectedCharacter, CancellationToken ct)
+{
+    try
+    {
+        var details = await authOtp.Api<EntityQueryNetGameDetailRequest, Entity<EntityQueryNetGameDetailItem>>(
+            "/item-details/get_v2",
+            new EntityQueryNetGameDetailRequest { ItemId = serverId });
+
+        var address = await authOtp.Api<EntityAddressRequest, Entity<EntityNetGameServerAddress>>(
+            "/item-address/get",
+            new EntityAddressRequest { ItemId = serverId });
+
+        var version = details.Data!.McVersionList[0];
+        var gameVersion = GameVersionUtil.GetEnumFromGameVersion(version.Name);
+
+        var serverModInfo = await InstallerService.InstallGameMods(
+            authOtp.EntityId,
+            authOtp.Token,
+            gameVersion,
+            new WPFLauncher(),
+            serverId,
+            false);
+
+        var mods = JsonSerializer.Serialize(serverModInfo);
+
+        CreateProxyInterceptor(authOtp, services.Yggdrasil, new EntityNetGameItem { EntityId = serverId, Name = serverName }, selectedCharacter, version, address.Data!, mods);
+
+        await X19.InterconnectionApi.GameStartAsync(authOtp.EntityId, authOtp.Token, serverId);
+        Log.Information("代理服务器已创建并启动。");
+
+        await Task.Delay(Timeout.Infinite, ct);
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "启动代理时发生错误");
+        return false;
+    }
+}
+
 internal record Services(
     WebNexusApi Api,
     Channel4399Register Register,
@@ -435,3 +900,22 @@ internal record Services(
     X19 X19,
     StandardYggdrasil Yggdrasil
 );
+
+internal static class AppState
+{
+    public static Services? Services;
+    public static ConcurrentDictionary<string, string> Accounts { get; } = new();
+    public static ConcurrentDictionary<string, X19AuthenticationOtp> Auths { get; } = new();
+    public static string? SelectedAccountId;
+    public static ConcurrentDictionary<string, ChannelInfo> Channels { get; } = new();
+}
+
+internal class ChannelInfo
+{
+    public string ServerId { get; set; } = string.Empty;
+    public string ServerName { get; set; } = string.Empty;
+    public string Ip { get; set; } = string.Empty;
+    public int Port { get; set; }
+    public string RoleName { get; set; } = string.Empty;
+    public CancellationTokenSource Cts { get; set; } = new CancellationTokenSource();
+}
