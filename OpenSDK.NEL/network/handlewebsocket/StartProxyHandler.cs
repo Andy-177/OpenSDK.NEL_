@@ -1,0 +1,175 @@
+using Codexus.Cipher.Protocol;
+using Codexus.OpenSDK;
+
+namespace OpenSDK.NEL.HandleWebSocket;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Text;
+using System.Threading;
+using Serilog;
+using OpenSDK.NEL;
+using Codexus.Cipher.Entities;
+using Codexus.Development.SDK.Entities;
+using Codexus.Cipher.Entities.WPFLauncher.NetGame;
+using Codexus.Game.Launcher.Services.Java;
+using Codexus.Game.Launcher.Utils;
+using Codexus.OpenSDK.Entities.X19;
+using Codexus.OpenSDK.Yggdrasil;
+
+internal class StartProxyHandler : IWsHandler
+{
+    public async Task ProcessAsync(System.Net.WebSockets.WebSocket ws, JsonElement root)
+    {
+        var serverId = root.TryGetProperty("serverId", out var sid) ? sid.GetString() : null;
+        var serverName = root.TryGetProperty("serverName", out var sname) ? sname.GetString() : string.Empty;
+        var roleId = root.TryGetProperty("roleId", out var rid) ? rid.GetString() : null;
+        var sel = AppState.SelectedAccountId;
+        if (string.IsNullOrEmpty(sel) || !AppState.Auths.TryGetValue(sel, out var auth))
+        {
+            var notLogin = JsonSerializer.Serialize(new { type = "notlogin" });
+            await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(notLogin)), System.Net.WebSockets.WebSocketMessageType.Text, true, System.Threading.CancellationToken.None);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(serverId) || string.IsNullOrWhiteSpace(roleId))
+        {
+            var err = JsonSerializer.Serialize(new { type = "start_error", message = "参数错误" });
+            await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, System.Threading.CancellationToken.None);
+            return;
+        }
+        try
+        {
+            var roles = await GetServerRolesByIdAsync(auth, serverId);
+            var selected = roles.FirstOrDefault(r => r.GameId == roleId);
+            if (selected == null)
+            {
+                var err = JsonSerializer.Serialize(new { type = "start_error", message = "角色不存在" });
+                await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, System.Threading.CancellationToken.None);
+                return;
+            }
+            var address = await auth.Api<EntityAddressRequest, Codexus.Cipher.Entities.Entity<Codexus.Cipher.Entities.WPFLauncher.NetGame.EntityNetGameServerAddress>>(
+                "/item-address/get",
+                new EntityAddressRequest { ItemId = serverId });
+            var cts = new CancellationTokenSource();
+            AppState.Channels[serverId!] = new ChannelInfo
+            {
+                ServerId = serverId!,
+                ServerName = serverName,
+                Ip = address.Data!.Ip,
+                Port = address.Data!.Port,
+                RoleName = selected.Name,
+                Cts = cts
+            };
+            _ = Task.Run(async () =>
+            {
+                await StartProxyWithRoleByIdAsync(auth, AppState.Services!, serverId!, serverName, selected, cts.Token);
+            });
+            var items3 = AppState.Channels.Values.Select(ch => new { serverId = ch.ServerId, serverName = ch.ServerName, address = ch.Ip + ":" + ch.Port }).ToArray();
+            var ok = JsonSerializer.Serialize(new { type = "channels", items = items3 });
+            await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(ok)), System.Net.WebSockets.WebSocketMessageType.Text, true, System.Threading.CancellationToken.None);
+        }
+        catch (System.Exception ex)
+        {
+            Log.Error(ex, "启动代理失败");
+            var err = JsonSerializer.Serialize(new { type = "start_error", message = "启动失败" });
+            await ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(err)), System.Net.WebSockets.WebSocketMessageType.Text, true, System.Threading.CancellationToken.None);
+        }
+    }
+
+    private static async Task<EntityGameCharacter[]> GetServerRolesByIdAsync(X19AuthenticationOtp authOtp, string serverId)
+    {
+        var roles = await authOtp.Api<EntityQueryGameCharacters, Entities<EntityGameCharacter>>(
+            "/game-character/query/user-game-characters",
+            new EntityQueryGameCharacters
+            {
+                GameId = serverId,
+                UserId = authOtp.EntityId
+            });
+        return roles.Data;
+    }
+
+    private static async Task<bool> StartProxyWithRoleByIdAsync(X19AuthenticationOtp authOtp, Services services, string serverId, string serverName, EntityGameCharacter selectedCharacter, CancellationToken ct)
+    {
+        try
+        {
+            var details = await authOtp.Api<EntityQueryNetGameDetailRequest, Codexus.Cipher.Entities.Entity<EntityQueryNetGameDetailItem>>(
+                "/item-details/get_v2",
+                new EntityQueryNetGameDetailRequest { ItemId = serverId });
+
+            var address = await authOtp.Api<EntityAddressRequest, Codexus.Cipher.Entities.Entity<EntityNetGameServerAddress>>(
+                "/item-address/get",
+                new EntityAddressRequest { ItemId = serverId });
+
+            var version = details.Data!.McVersionList[0];
+            var gameVersion = GameVersionUtil.GetEnumFromGameVersion(version.Name);
+
+            var serverModInfo = await InstallerService.InstallGameMods(
+                authOtp.EntityId,
+                authOtp.Token,
+                gameVersion,
+                new WPFLauncher(),
+                serverId,
+                false);
+
+            var mods = JsonSerializer.Serialize(serverModInfo);
+
+            CreateProxyInterceptor(authOtp, services.Yggdrasil, new EntityNetGameItem { EntityId = serverId, Name = serverName }, selectedCharacter, version, address.Data!, mods);
+
+            await X19.InterconnectionApi.GameStartAsync(authOtp.EntityId, authOtp.Token, serverId);
+            Log.Information("代理服务器已创建并启动。");
+
+            await Task.Delay(Timeout.Infinite, ct);
+            return true;
+        }
+        catch (System.Exception ex)
+        {
+            Log.Error(ex, "启动代理时发生错误");
+            return false;
+        }
+    }
+
+    private static void CreateProxyInterceptor(X19AuthenticationOtp authOtp, StandardYggdrasil yggdrasil, EntityNetGameItem server, EntityGameCharacter character, Codexus.Cipher.Entities.WPFLauncher.NetGame.EntityMcVersion version, Codexus.Cipher.Entities.WPFLauncher.NetGame.EntityNetGameServerAddress address, string mods)
+    {
+        Codexus.Interceptors.Interceptor.CreateInterceptor(
+            new EntitySocks5 { Enabled = false },
+            mods,
+            server.EntityId,
+            server.Name,
+            version.Name,
+            address.Ip,
+            address.Port,
+            character.Name,
+            authOtp.EntityId,
+            authOtp.Token,
+            (System.Action<string>)((serverId) =>
+            {
+                Log.Information("Server ID: {Certification}", serverId);
+                var pair = OpenSDK.NEL.Md5Mapping.GetMd5FromGameVersion(version.Name);
+                var signal = new SemaphoreSlim(0);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var success = await yggdrasil.JoinServerAsync(new Codexus.OpenSDK.Entities.Yggdrasil.GameProfile
+                        {
+                            GameId = server.EntityId,
+                            GameVersion = version.Name,
+                            BootstrapMd5 = pair.BootstrapMd5,
+                            DatFileMd5 = pair.DatFileMd5,
+                            Mods = JsonSerializer.Deserialize<Codexus.OpenSDK.Entities.Yggdrasil.ModList>(mods)!,
+                            User = new Codexus.OpenSDK.Entities.Yggdrasil.UserProfile { UserId = int.Parse(authOtp.EntityId), UserToken = authOtp.Token }
+                        }, serverId);
+                        if (success.IsSuccess) Log.Information("消息认证成功"); else Log.Error("消息认证失败: {Error}", success.Error);
+                    }
+                    catch (System.Exception e)
+                    {
+                        Log.Error(e, "认证过程中发生异常");
+                    }
+                    finally
+                    {
+                        signal.Release();
+                    }
+                });
+                signal.Wait();
+            }));
+    }
+}

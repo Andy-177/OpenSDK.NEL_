@@ -384,10 +384,12 @@
                     </div>
                     <div id="paneCookie">
                         <input id="modalCookie" type="text" placeholder="输入Cookie" />
+                        <div id="loginAlert" style="margin-top:8px;color:#ef4444;display:none"></div>
                     </div>
                     <div id="pane4399" style="display:none;">
                         <input id="acc4399" type="text" placeholder="账号" style="margin-bottom:8px;"/>
                         <input id="pwd4399" type="password" placeholder="密码"/>
+                        <div id="loginAlert4399" style="margin-top:8px;color:#ef4444;display:none"></div>
                     </div>
                 </div>
                 <div class="modal-actions">
@@ -410,23 +412,25 @@
                     const cookie = dialog.querySelector('#modalCookie').value.trim();
                     if (!cookie) return;
                     sendMessage({ type: 'cookie_login', cookie });
-                    close();
                     return;
                 }
                 const account = dialog.querySelector('#acc4399').value.trim();
                 const password = dialog.querySelector('#pwd4399').value.trim();
                 if (!account || !password) return;
                 sendMessage({ type: 'login_4399', account, password });
-                close();
             };
             wsOnMessageHook = data => {
-                if (data.type === 'login_success') addAccount(data.entityId, data.channel);
-                if (data.type === 'captcha_required') openCaptchaModal(data.account, data.password, data.sessionId);
+                if (data.type === 'login_success' || data.type === 'Success_login') { addAccount(data.entityId, data.channel); close(); }
+                if (data.type === 'login_error') {
+                    const el = paneCookie.style.display !== 'none' ? dialog.querySelector('#loginAlert') : dialog.querySelector('#loginAlert4399');
+                    if (el) { el.textContent = data.message || '登录失败'; el.style.display = 'block'; }
+                }
+                if (data.type === 'captcha_required') openCaptchaModal(data.account, data.password);
             };
             return { open };
         }
 
-        function openCaptchaModal(account, password, sessionId) {
+        function openCaptchaModal(account, password) {
             const overlay = document.createElement('div');
             overlay.className = 'modal-overlay';
             const dialog = document.createElement('div');
@@ -434,7 +438,9 @@
             dialog.innerHTML = `
                 <div class="modal-header">输入验证码</div>
                 <div class="modal-body">
+                    <input id="sessionInput" type="text" placeholder="输入会话ID" style="margin-bottom:8px;" />
                     <input id="captchaInput" type="text" placeholder="输入图形验证码" />
+                    <div id="capAlert" style="margin-top:8px;color:#ef4444;display:none"></div>
                 </div>
                 <div class="modal-actions">
                     <button id="capCancel" class="btn">取消</button>
@@ -447,10 +453,18 @@
             const close = () => { overlay.remove(); };
             dialog.querySelector('#capCancel').onclick = close;
             dialog.querySelector('#capOk').onclick = () => {
+                const sessionId = dialog.querySelector('#sessionInput').value.trim();
                 const captcha = dialog.querySelector('#captchaInput').value.trim();
-                if (!captcha) return;
-                sendMessage({ type: 'login_4399_with_captcha', sessionId, captcha });
-                close();
+                if (!sessionId || !captcha) return;
+                sendMessage({ type: 'login_4399_with_captcha', account, password, sessionId, captcha });
+            };
+            const hookPrev = wsOnMessageHook;
+            wsOnMessageHook = data => {
+                if (data.type === 'login_success' || data.type === 'Success_login') { close(); if (hookPrev) hookPrev(data); }
+                if (data.type === 'login_error') {
+                    const el = dialog.querySelector('#capAlert');
+                    if (el) { el.textContent = data.message || '登录失败'; el.style.display = 'block'; }
+                }
             };
         }
 
