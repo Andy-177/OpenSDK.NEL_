@@ -8,14 +8,7 @@
 </head>
 <body>
   <div class="layout">
-    <aside class="sidebar">
-      <div class="brand">OpenSDK.NEL</div>
-      <ul class="menu">
-        <li data-view="dash">概括</li>
-        <li data-view="serverlist" class="active">服务器列表</li>
-        <li data-view="game">游戏</li>
-      </ul>
-    </aside>
+    <aside id="sidebar"></aside>
     <main class="main">
       <div class="panel">
         <h3>服务器列表</h3>
@@ -33,7 +26,8 @@
     function openAddRoleModal(serverId){const overlay=document.createElement('div');overlay.className='modal-overlay';const dialog=document.createElement('div');dialog.className='modal';dialog.innerHTML=`<div class=\"modal-header\">添加角色</div><div class=\"modal-body\"><input id=\"roleNameInput\" type=\"text\" placeholder=\"输入角色名称\" /><div style=\"margin-top:8px; display:flex; gap:8px;\"><button id=\"btnRandom\" class=\"btn\">随机名字</button><button id=\"btnManual\" class=\"btn btn-primary\">添加</button></div></div><div class=\"modal-actions\"><button id=\"addCancel\" class=\"btn\">关闭</button></div>`;overlay.appendChild(dialog);document.body.appendChild(overlay);overlay.style.display='flex';const close=()=>{overlay.remove()};dialog.querySelector('#addCancel').onclick=close;dialog.querySelector('#btnRandom').onclick=()=>{const letters='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';const digits='0123456789';const pool=letters+digits;let n='';for(let i=0;i<12;i++)n+=pool[Math.floor(Math.random()*pool.length)];dialog.querySelector('#roleNameInput').value=n};dialog.querySelector('#btnManual').onclick=()=>{const name=dialog.querySelector('#roleNameInput').value.trim();if(!name)return;sendMessage({type:'create_role_named',serverId,name});close()}}
     function bindNav(){document.querySelectorAll('.menu li').forEach(li=>li.addEventListener('click',()=>{const v=li.dataset.view;if(v==='dash')sendMessage({type:'open_dash'});if(v==='serverlist')sendMessage({type:'open_serverlist'});if(v==='game')sendMessage({type:'open_game'})}))}
     function requestServers(){const kw=document.getElementById('serverKeyword').value.trim();sendMessage({type:'list_servers',keyword:kw})}
-    window.onload=function(){connect();bindNav();document.getElementById('btnSearchServers').onclick=requestServers;requestServers()}
+    async function loadSidebar(){const res=await fetch('/sidebar.html');const html=await res.text();document.getElementById('sidebar').innerHTML=html;document.querySelectorAll('.menu li').forEach(li=>li.addEventListener('click',()=>{const v=li.dataset.view;if(v==='dash')sendMessage({type:'open_dash'});if(v==='serverlist')sendMessage({type:'open_serverlist'});if(v==='game')sendMessage({type:'open_game'})}));document.querySelector('.menu li[data-view="serverlist"]').classList.add('active')}
+    window.onload=function(){connect();loadSidebar();document.getElementById('btnSearchServers').onclick=requestServers;requestServers()}
   </script>
 </body>
 </html>

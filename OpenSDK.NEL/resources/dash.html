@@ -8,14 +8,7 @@
 </head>
 <body>
   <div class="layout">
-    <aside class="sidebar">
-      <div class="brand">OpenSDK.NEL</div>
-      <ul class="menu">
-        <li data-view="dash" class="active">概括</li>
-        <li data-view="serverlist">服务器列表</li>
-        <li data-view="game">游戏</li>
-      </ul>
-    </aside>
+    <aside id="sidebar"></aside>
     <main class="main">
       <div class="status"><div class="status-item"><div>连接状态</div><div class="status-value" id="wsStatus">断开</div></div></div>
       <div class="panel">
@@ -34,7 +27,8 @@
     function addAccount(id,ch){const list=document.getElementById('accountList');if(list.querySelector('.account-item'))list.innerHTML='';const item=document.createElement('div');item.className='account-row';item.innerHTML=`<div class="account-main"><div class="account-id">${id}</div><div class="account-desc">${ch}</div></div><div class="account-actions"><button class="btn btn-danger btn-delete">删除</button></div>`;list.appendChild(item);item.querySelector('.btn-delete').onclick=()=>item.remove()}
     function openCaptchaModal(account,password){const overlay=document.createElement('div');overlay.className='modal-overlay';const dialog=document.createElement('div');dialog.className='modal';dialog.innerHTML=`<div class="modal-header">输入验证码</div><div class="modal-body"><input id="sessionInput" type="text" placeholder="输入会话ID" style="margin-bottom:8px;" /><input id="captchaInput" type="text" placeholder="输入图形验证码" /><div id="capAlert" style="margin-top:8px;color:#ef4444;display:none"></div></div><div class="modal-actions"><button id="capCancel" class="btn">取消</button><button id="capOk" class="btn btn-primary">提交</button></div>`;overlay.appendChild(dialog);document.body.appendChild(overlay);overlay.style.display='flex';const close=()=>{overlay.remove()};dialog.querySelector('#capCancel').onclick=close;dialog.querySelector('#capOk').onclick=()=>{const sessionId=dialog.querySelector('#sessionInput').value.trim();const captcha=dialog.querySelector('#captchaInput').value.trim();if(!sessionId||!captcha)return;sendMessage({type:'login_4399_with_captcha',account,password,sessionId,captcha})};const prev=wsOnMessageHook;wsOnMessageHook=d=>{if(d.type==='Success_login'){close();if(prev)prev(d)}if(d.type==='login_error'){const el=dialog.querySelector('#capAlert');if(el){el.textContent=d.message||'登录失败';el.style.display='block'}}}}
     function bindNav(){document.querySelectorAll('.menu li').forEach(li=>li.addEventListener('click',()=>{const v=li.dataset.view;if(v==='dash')sendMessage({type:'open_dash'});if(v==='serverlist')sendMessage({type:'open_serverlist'});if(v==='game')sendMessage({type:'open_game'})}))}
-    window.onload=function(){connect();bindNav();sendMessage({type:'list_accounts'});const modal=createModal();document.getElementById('btnAddAccount').onclick=()=>modal.open()}
+    async function loadSidebar(){const res=await fetch('/sidebar.html');const html=await res.text();document.getElementById('sidebar').innerHTML=html;bindNav();document.querySelector('.menu li[data-view="dash"]').classList.add('active')}
+    window.onload=function(){connect();loadSidebar();sendMessage({type:'list_accounts'});const modal=createModal();document.getElementById('btnAddAccount').onclick=()=>modal.open()}
   </script>
 </body>
 </html>
